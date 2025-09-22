@@ -1,24 +1,31 @@
-;; error codes
+;; Token Streaming Protocol - Working Version
+
+;; Error codes
 (define-constant ERR_UNAUTHORIZED (err u0))
 (define-constant ERR_INVALID_SIGNATURE (err u1))
 (define-constant ERR_STREAM_STILL_ACTIVE (err u2))
 (define-constant ERR_INVALID_STREAM_ID (err u3))
+(define-constant ERR_NO_WITHDRAWABLE_BALANCE (err u4))
+(define-constant ERR_NO_REFUNDABLE_BALANCE (err u5))
+(define-constant ERR_CONSENSUS_BUFFER_CONVERSION (err u6))
+(define-constant ERR_INVALID_AMOUNT (err u7))
 
-;; data vars
+;; Data variables
 (define-data-var latest-stream-id uint u0)
 
-;; streams mapping
+;; Streams mapping
 (define-map streams
     uint ;; stream id
     {
         sender: principal,
         recipient: principal,
         balance: uint,
-        withdrawal-balance: uint,
+        withdrawn-balance: uint,
         payment-per-block: uint,
         timeframe: (tuple (start-block uint) (stop-block uint))
     }
 )
+
 ;; Create a new stream
 (define-public (stream-to
     (recipient principal)
@@ -31,18 +38,13 @@
         sender: contract-caller,
         recipient: recipient,
         balance: initial-balance,
-        withdrawal-balance: u0,
+        withdrawn-balance: u0,
         payment-per-block: payment-per-block,
         timeframe: timeframe
     })
     (current-stream-id (var-get latest-stream-id))
   )
-    ;; stx-transfer takes in (amount, sender, recipient)
-    ;; for the `recipient` - we do `(as-contract tx-sender)`
-    ;; `as-contract` switches the `tx-sender` variable to be the contract principal
-    ;; inside it's scope
-    ;; this doing this `as-contract tx-sender` gives us the contract address itself 
-    ;; this is like doing address(this) in solidity
+    (asserts! (> initial-balance u0) ERR_INVALID_AMOUNT) ;; ADDED CHECK
     (try! (stx-transfer? initial-balance contract-caller (as-contract tx-sender)))
     (map-set streams current-stream-id stream)
     (var-set latest-stream-id (+ current-stream-id u1))
@@ -58,34 +60,29 @@
   (let (
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
   )
-  (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
-  (try! (stx-transfer? amount contract-caller (as-contract tx-sender)))
-  (map-set streams stream-id 
-    (merge stream {balance: (+ (get balance stream) amount)})
-  )
-  (ok amount)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT) ;; ADDED CHECK
+    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
+    (try! (stx-transfer? amount contract-caller (as-contract tx-sender)))
+    (map-set streams stream-id 
+      (merge stream {balance: (+ (get balance stream) amount)})
+    )
+    (ok amount)
   )
 )
 
-
-
-;; Calculate the number of blocks a stream has been active
+;; Calculate how many blocks have elapsed for streaming
 (define-read-only (calculate-block-delta
     (timeframe (tuple (start-block uint) (stop-block uint)))
   )
   (let (
     (start-block (get start-block timeframe))
     (stop-block (get stop-block timeframe))
-
+    (current-block (+ burn-block-height u1))
     (delta 
-      (if (<= block-height start-block)
-        ;; then
+      (if (<= current-block start-block)
         u0
-        ;; else
-        (if (< block-height stop-block)
-          ;; then
-          (- block-height start-block)
-          ;; else
+        (if (< current-block stop-block)
+          (- current-block start-block)
           (- stop-block start-block)
         ) 
       )
@@ -100,92 +97,120 @@
     (stream-id uint)
     (who principal)
   )
-  (let (
-    (stream (unwrap! (map-get? streams stream-id) u0))
-    (block-delta (calculate-block-delta (get timeframe stream)))
-    (recipient-balance (* block-delta (get payment-per-block stream)))
-  )
-    (if (is-eq who (get recipient stream))
-      (- recipient-balance (get withdrawn-balance stream))
-      (if (is-eq who (get sender stream))
-        (- (get balance stream) recipient-balance)
-        u0
+  (match (map-get? streams stream-id)
+    stream (let (
+      (block-delta (calculate-block-delta (get timeframe stream)))
+      (recipient-balance (* block-delta (get payment-per-block stream)))
+    )
+      (if (is-eq who (get recipient stream))
+        (if (> recipient-balance (get withdrawn-balance stream))
+          (- recipient-balance (get withdrawn-balance stream))
+          u0
+        )
+        (if (is-eq who (get sender stream))
+          (if (> (get balance stream) recipient-balance)
+            (- (get balance stream) recipient-balance)
+            u0
+          )
+          u0
+        )
       )
     )
+    u0
   )
 )
 
 ;; Withdraw received tokens
 (define-public (withdraw
-    (stream-d uint)
+    (stream-id uint)
   )
   (let (
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
-    (balance (balance-of stream-id contract-caller))
+    (withdrawable-balance (balance-of stream-id contract-caller))
   )
-     (asserts! (is-eq contract-caller (get recipient stream)) ERR_UNAUTHORIZED)
-     (map-set streams stream-id
-     (merge stream {withdrawn-balance: (+ (get withdrawn-balance stream) balance)} 
-     )
-     (try! (as-contract (stx-transfer? balance tx-sender (get recipient stream))))
-     (ok balance)
+    (asserts! (is-eq contract-caller (get recipient stream)) ERR_UNAUTHORIZED)
+    (asserts! (> withdrawable-balance u0) ERR_NO_WITHDRAWABLE_BALANCE)
+    
+    (map-set streams stream-id
+      (merge stream {withdrawn-balance: (+ (get withdrawn-balance stream) withdrawable-balance)})
     )
+    
+    (try! (as-contract (stx-transfer? withdrawable-balance tx-sender (get recipient stream))))
+    (ok withdrawable-balance)
   )
 )
 
-;; Withdraw excess locked tokens
+;; Withdraw excess locked tokens (sender only, after stream ends)
 (define-public (refund
     (stream-id uint)
   )
   (let (
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
-    (balance (balance-of stream-id (get sender stream)))
+    (refundable-balance (balance-of stream-id (get sender stream)))
   )
     (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
-    (asserts! (< (get stop-block (get timeframe stream)) block-height) ERR_STREAM_STILL_ACTIVE)
-    (map-set streams stream-id (merge stream {
-        balance: (- (get balance stream) balance),
-      }
-    ))
-    (try! (as-contract (stx-transfer? balance tx-sender (get sender stream))))
-    (ok balance)
+    (asserts! (< (get stop-block (get timeframe stream)) burn-block-height) ERR_STREAM_STILL_ACTIVE)
+    (asserts! (> refundable-balance u0) ERR_NO_REFUNDABLE_BALANCE)
+    
+    (map-set streams stream-id 
+      (merge stream {balance: (- (get balance stream) refundable-balance)})
+    )
+    
+    (try! (as-contract (stx-transfer? refundable-balance tx-sender (get sender stream))))
+    (ok refundable-balance)
   )
 )
 
-;; Get hash of stream
+;; Get hash of stream for signature verification
 (define-read-only (hash-stream
     (stream-id uint)
     (new-payment-per-block uint)
     (new-timeframe (tuple (start-block uint) (stop-block uint)))
   )
-  (let (
-    (stream (unwrap! (map-get? streams stream-id) (sha256 0)))
-    (msg (concat (concat (unwrap-panic (to-consensus-buff? stream)) (unwrap-panic (to-consensus-buff? new-payment-per-block))) (unwrap-panic (to-consensus-buff? new-timeframe))))
-  )
-    (sha256 msg)
+  (match (map-get? streams stream-id)
+    stream (match (to-consensus-buff? stream)
+      stream-buff (match (to-consensus-buff? new-payment-per-block)
+        payment-buff (match (to-consensus-buff? new-timeframe)
+          timeframe-buff (let (
+            (combined-buff (concat (concat stream-buff payment-buff) timeframe-buff))
+          )
+            (ok (sha256 combined-buff))
+          )
+          (err ERR_CONSENSUS_BUFFER_CONVERSION)
+        )
+        (err ERR_CONSENSUS_BUFFER_CONVERSION)
+      )
+      (err ERR_CONSENSUS_BUFFER_CONVERSION)
+    )
+    (err ERR_INVALID_STREAM_ID)
   )
 )
 
-;; Signature verification
-(define-read-only (validate-signature (hash (buff 32)) (signature (buff 65)) (signer principal))
-        (is-eq 
-          (principal-of? (unwrap! (secp256k1-recover? hash signature) false)) 
-          (ok signer)
-        )
+;; Verify signature
+(define-read-only (validate-signature 
+    (message-hash (buff 32)) 
+    (signature (buff 65)) 
+    (signer principal)
+  )
+  (is-eq 
+    (principal-of? (unwrap! (secp256k1-recover? message-hash signature) false)) 
+    (ok signer)
+  )
 )
 
 ;; Update stream configuration
 (define-public (update-details
     (stream-id uint)
-    (payment-per-block uint)
-    (timeframe (tuple (start-block uint) (stop-block uint)))
+    (new-payment-per-block uint)
+    (new-timeframe (tuple (start-block uint) (stop-block uint)))
     (signer principal)
     (signature (buff 65))
   )
   (let (
-    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))  
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+    (message-hash (unwrap! (hash-stream stream-id new-payment-per-block new-timeframe) (err u6)))
   )
-    (asserts! (validate-signature (hash-stream stream-id payment-per-block timeframe) signature signer) ERR_INVALID_SIGNATURE)
+    (asserts! (validate-signature message-hash signature signer) ERR_INVALID_SIGNATURE)
     (asserts!
       (or
         (and (is-eq (get sender stream) contract-caller) (is-eq (get recipient stream) signer))
@@ -193,39 +218,21 @@
       )
       ERR_UNAUTHORIZED
     )
-    (map-set streams stream-id (merge stream {
-        payment-per-block: payment-per-block,
-        timeframe: timeframe
-    }))
+    (map-set streams stream-id 
+      (merge stream {
+        payment-per-block: new-payment-per-block,
+        timeframe: new-timeframe
+      })
+    )
     (ok true)
   )
 )
 
-;; version:
-;; summary:
-;; description:
+;; Read-only helper functions
+(define-read-only (get-stream (stream-id uint))
+  (map-get? streams stream-id)
+)
 
-;; traits
-;;
-
-;; token definitions
-;;
-
-;; constants
-;;
-
-;; data vars
-;;
-
-;; data maps
-;;
-
-;; public functions
-;;
-
-;; read only functions
-;;
-
-;; private functions
-;;
-
+(define-read-only (get-latest-stream-id)
+  (var-get latest-stream-id)
+)

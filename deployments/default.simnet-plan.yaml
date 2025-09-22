@@ -59,12 +59,4 @@ genesis:
     - signers
     - signers-voting
 plan:
-  batches:
-    - id: 0
-      transactions:
-        - emulated-contract-publish:
-            contract-name: stream
-            emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/stream.clar
-            clarity-version: 3
-      epoch: "3.2"
+  batches: []
