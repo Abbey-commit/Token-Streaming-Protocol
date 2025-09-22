@@ -120,6 +120,8 @@
   )
 )
 
+;; (define-read-only (balance-of (stream-id uint) (who principal) ) (match (map-get? streams stream-id) stream (let ( (block-delta (calculate-block-delta (get timeframe stream))) (recipient-balance (* block-delta (get payment-per-block stream))) ) (if (is-eq who (get recipient stream)) (if (> recipient-balance (get withdrawn-balance stream)) (- recipient-balance (get withdrawn-balance stream)) u0 ) (if (is-eq who (get sender stream)) (if (> (get balance stream) recipient-balance) (- (get balance stream) recipient-balance) u0 ) u0 ) ) ) u0 ) )
+
 ;; Withdraw received tokens
 (define-public (withdraw
     (stream-id uint)
