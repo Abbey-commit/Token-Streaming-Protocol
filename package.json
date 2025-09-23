@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "clarinet test --test-runner=vitest",
+    "test": "vitest run",
     "vitest": "vitest run",
     "test:report": "vitest run -- --coverage --costs",
     "test:watch": "chokidar \"tests/**/*.ts\" \"contracts/**/*.clar\" -c \"npm run test:report\""
@@ -13,13 +13,13 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@hirosystems/clarinet-sdk": "^3.6.1",
-    "@stacks/transactions": "^7.2.0",
     "chokidar-cli": "^3.0.0",
-    "vitest": "^3.2.4",
     "vitest-environment-clarinet": "^2.3.0"
   },
   "devDependencies": {
-    "@types/node": "^24.5.2"
+    "@hirosystems/clarinet-sdk": "^3.6.1",
+    "@stacks/transactions": "^7.2.0",
+    "@types/node": "^24.5.2",
+    "vitest": "^3.2.4"
   }
 }
