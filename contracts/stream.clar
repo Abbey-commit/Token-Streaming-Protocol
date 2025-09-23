@@ -1,4 +1,4 @@
-;; Token Streaming Protocol - Working Version
+;; Token Streaming Protocol - Fixed Version
 
 ;; Error codes
 (define-constant ERR_UNAUTHORIZED (err u0))
@@ -9,6 +9,7 @@
 (define-constant ERR_NO_REFUNDABLE_BALANCE (err u5))
 (define-constant ERR_CONSENSUS_BUFFER_CONVERSION (err u6))
 (define-constant ERR_INVALID_AMOUNT (err u7))
+(define-constant ERR_INVALID_DURATION (err u8))
 
 ;; Data variables
 (define-data-var latest-stream-id uint u0)
@@ -34,21 +35,58 @@
     (payment-per-block uint)
   ) 
   (let (
+    (start-block (get start-block timeframe))
+    (stop-block (get stop-block timeframe))
+    (current-stream-id (var-get latest-stream-id))
     (stream {
-        sender: contract-caller,
+        sender: tx-sender,
         recipient: recipient,
         balance: initial-balance,
         withdrawn-balance: u0,
         payment-per-block: payment-per-block,
         timeframe: timeframe
     })
-    (current-stream-id (var-get latest-stream-id))
   )
-    (asserts! (> initial-balance u0) ERR_INVALID_AMOUNT) ;; ADDED CHECK
-    (try! (stx-transfer? initial-balance contract-caller (as-contract tx-sender)))
-    (map-set streams current-stream-id stream)
-    (var-set latest-stream-id (+ current-stream-id u1))
-    (ok current-stream-id)
+    ;; Validate inputs BEFORE calculating duration
+    (asserts! (> initial-balance u0) ERR_INVALID_AMOUNT)
+    (asserts! (> stop-block start-block) ERR_INVALID_DURATION)
+    
+    ;; Calculate duration after validation
+    (let ((duration (- stop-block start-block)))
+      (asserts! (>= initial-balance duration) ERR_INVALID_AMOUNT)
+      
+      (try! (stx-transfer? initial-balance tx-sender (as-contract tx-sender)))
+      (map-set streams current-stream-id stream)
+      (var-set latest-stream-id (+ current-stream-id u1))
+      (ok current-stream-id)
+    )
+  )
+)
+
+;; Cancel a stream (sender only, refunds remaining balance)
+(define-public (cancel
+    (stream-id uint)
+  )
+  (let (
+    (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
+    (current-block (+ burn-block-height u1))
+    (block-delta (calculate-block-delta (get timeframe stream)))
+    (recipient-balance (* block-delta (get payment-per-block stream)))
+    (remaining-balance (- (get balance stream) recipient-balance))
+  )
+    (asserts! (is-eq tx-sender (get sender stream)) ERR_UNAUTHORIZED)
+    
+    ;; If there's remaining balance, refund to sender
+    (if (> remaining-balance u0)
+      (begin
+        (try! (as-contract (stx-transfer? remaining-balance tx-sender (get sender stream))))
+        (map-set streams stream-id 
+          (merge stream {balance: recipient-balance})
+        )
+      )
+      true
+    )
+    (ok remaining-balance)
   )
 )
 
@@ -60,9 +98,9 @@
   (let (
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
   )
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT) ;; ADDED CHECK
-    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
-    (try! (stx-transfer? amount contract-caller (as-contract tx-sender)))
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq tx-sender (get sender stream)) ERR_UNAUTHORIZED)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     (map-set streams stream-id 
       (merge stream {balance: (+ (get balance stream) amount)})
     )
@@ -71,13 +109,14 @@
 )
 
 ;; Calculate how many blocks have elapsed for streaming
+;; FIXED: Use burn-block-height directly, not +1
 (define-read-only (calculate-block-delta
     (timeframe (tuple (start-block uint) (stop-block uint)))
   )
   (let (
     (start-block (get start-block timeframe))
     (stop-block (get stop-block timeframe))
-    (current-block (+ burn-block-height u1))
+    (current-block burn-block-height)  ;; FIXED: Remove the +1
     (delta 
       (if (<= current-block start-block)
         u0
@@ -120,25 +159,25 @@
   )
 )
 
-;; (define-read-only (balance-of (stream-id uint) (who principal) ) (match (map-get? streams stream-id) stream (let ( (block-delta (calculate-block-delta (get timeframe stream))) (recipient-balance (* block-delta (get payment-per-block stream))) ) (if (is-eq who (get recipient stream)) (if (> recipient-balance (get withdrawn-balance stream)) (- recipient-balance (get withdrawn-balance stream)) u0 ) (if (is-eq who (get sender stream)) (if (> (get balance stream) recipient-balance) (- (get balance stream) recipient-balance) u0 ) u0 ) ) ) u0 ) )
-
-;; Withdraw received tokens
+;; Withdraw received tokens - Fixed version
 (define-public (withdraw
     (stream-id uint)
+    (amount uint)  ;; Add amount parameter to match test expectations
   )
   (let (
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
-    (withdrawable-balance (balance-of stream-id contract-caller))
+    (withdrawable-balance (balance-of stream-id tx-sender))
   )
-    (asserts! (is-eq contract-caller (get recipient stream)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (get recipient stream)) ERR_UNAUTHORIZED)
     (asserts! (> withdrawable-balance u0) ERR_NO_WITHDRAWABLE_BALANCE)
+    (asserts! (<= amount withdrawable-balance) ERR_INVALID_AMOUNT)
     
     (map-set streams stream-id
-      (merge stream {withdrawn-balance: (+ (get withdrawn-balance stream) withdrawable-balance)})
+      (merge stream {withdrawn-balance: (+ (get withdrawn-balance stream) amount)})
     )
     
-    (try! (as-contract (stx-transfer? withdrawable-balance tx-sender (get recipient stream))))
-    (ok withdrawable-balance)
+    (try! (as-contract (stx-transfer? amount tx-sender (get recipient stream))))
+    (ok amount)
   )
 )
 
@@ -150,7 +189,7 @@
     (stream (unwrap! (map-get? streams stream-id) ERR_INVALID_STREAM_ID))
     (refundable-balance (balance-of stream-id (get sender stream)))
   )
-    (asserts! (is-eq contract-caller (get sender stream)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq tx-sender (get sender stream)) ERR_UNAUTHORIZED)
     (asserts! (< (get stop-block (get timeframe stream)) burn-block-height) ERR_STREAM_STILL_ACTIVE)
     (asserts! (> refundable-balance u0) ERR_NO_REFUNDABLE_BALANCE)
     
@@ -215,8 +254,8 @@
     (asserts! (validate-signature message-hash signature signer) ERR_INVALID_SIGNATURE)
     (asserts!
       (or
-        (and (is-eq (get sender stream) contract-caller) (is-eq (get recipient stream) signer))
-        (and (is-eq (get sender stream) signer) (is-eq (get recipient stream) contract-caller))
+        (and (is-eq (get sender stream) tx-sender) (is-eq (get recipient stream) signer))
+        (and (is-eq (get sender stream) signer) (is-eq (get recipient stream) tx-sender))
       )
       ERR_UNAUTHORIZED
     )
